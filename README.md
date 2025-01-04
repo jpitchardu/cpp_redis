@@ -1,0 +1,1 @@
+Trying to learn C++ by implementing a redis-like system.
