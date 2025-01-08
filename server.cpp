@@ -4,99 +4,121 @@
 #include <unistd.h>
 #include <string.h>
 #include <cassert>
+#include <vector>
+#include <poll.h>
+#include <fcntl.h>
 
 const size_t k_max_msg = 4096;
 
-static int32_t read_full(int fd, char *buf, size_t n)
+static void set_Fd_nonblock(int fd)
 {
-  while (n > 0)
-  {
-    ssize_t rv = read(fd, buf, n);
-
-    if (rv <= 0)
-    {
-      return -1;
-    }
-
-    assert((size_t)rv <= n);
-
-    n -= (size_t)rv;
-    buf += rv;
-  }
-
-  return 0;
+  int flags = fcntl(fd, F_GETFL, 0);
+  flags |= O_NONBLOCK;
+  int rv = fcntl(fd, F_SETFL, flags);
+  assert(rv == 0);
 }
 
-static int32_t write_full(int fd, const char *buf, size_t n)
+struct Conn
 {
-  while (n > 0)
+  int fd = -1;
+
+  bool want_read = false;
+  bool want_write = false;
+  bool want_close = false;
+
+  std::vector<uint8_t> incoming;
+  std::vector<uint8_t> outgoing;
+};
+
+static Conn *handle_accept(int fd)
+{
+  struct sockaddr_in addr = {};
+  socklen_t len = sizeof(addr);
+  int conn_fd = accept(fd, (sockaddr *)&addr, &len);
+
+  if (conn_fd < 0)
   {
-    ssize_t rv = write(fd, buf, n);
-
-    if (rv <= 0)
-    {
-      return -1;
-    }
-
-    assert((size_t)rv <= n);
-
-    n -= (size_t)rv;
-    buf += rv;
+    return NULL;
   }
 
-  return 0;
+  set_Fd_nonblock(conn_fd);
+
+  Conn *conn = new Conn();
+  conn->fd = conn_fd;
+  conn->want_read = true;
+  return conn;
 }
 
-static int32_t one_request(int connfd)
+static void handle_read(Conn *conn)
 {
-  char rbuf[4 + k_max_msg + 1];
-
-  errno = 0;
-
-  int32_t err = read_full(connfd, rbuf, 4);
-
-  if (err)
+  uint8_t buf[64 * 1024];
+  ssize_t rv = read(conn->fd, buf, sizeof(buf));
+  if (rv <= 0)
   {
-    if (errno == 0)
-    {
-      std::cerr << "EOF" << std::endl;
-    }
-    else
-    {
-      std::cerr << "read_full() failed" << std::endl;
-    }
-    return err;
+    conn->want_close = true;
+    return;
+  }
+
+  conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
+
+  try_one_request(conn);
+
+  if (conn->outgoing.size() > 0)
+  {
+    conn->want_read = false;
+    conn->want_write = true;
+  }
+}
+
+static bool try_one_request(Conn *conn)
+{
+  if (conn->incoming.size() < 4)
+  {
+    return false;
   }
 
   uint32_t len = 0;
-  memcpy(&len, rbuf, 4);
+  memcpy(&len, &conn->incoming[0], 4);
 
   if (len > k_max_msg)
   {
-    std::cerr << "too long" << std::endl;
-    return -1;
+    conn->want_close = true;
+    return false;
   }
 
-  // Read the message
-  err = read_full(connfd, &rbuf[4], len);
-  if (err)
+  if (conn->incoming.size() < len + 4)
   {
-    std::cerr << "read_full() failed" << std::endl;
-    return err;
+    return false;
   }
 
-  rbuf[4 + len] = '\0';
-  printf("client says: %s\n", &rbuf[4]);
+  const uint8_t *data = &conn->incoming[4];
 
-  // Reply
+  conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)&len, (uint8_t *)&len + 4);
+  conn->outgoing.insert(conn->outgoing.end(), data, data + len);
 
-  const char reply[] = "world";
-  char wbuf[4 + sizeof(reply)];
-  len = (uint32_t)strlen(reply);
-  memcpy(wbuf, &len, 4);
-  memcpy(&wbuf[4], reply, len);
+  conn->incoming.erase(conn->incoming.begin(), conn->incoming.begin() + 4 + len);
 
-  return write_full(connfd, wbuf, 4 + len);
+  return true;
+}
+
+static void handle_write(Conn *conn)
+{
+  assert(!conn->outgoing.empty());
+  ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
+  if (rv < 0)
+  {
+    conn->want_close = true;
+    return;
+  }
+
+  conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
+
+  if (conn->outgoing.size() == 0)
+  {
+    conn->want_read = true;
+    conn->want_write = false;
+  }
 }
 
 int main()
@@ -128,29 +150,84 @@ int main()
     return 1;
   }
 
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+  // a map of all client connections, keyed by fd
+  std::vector<Conn *> fd2Conn;
+
+  std::vector<struct pollfd> poll_args;
+
   while (true)
   {
-    struct sockaddr_in client_addr = {};
-    socklen_t addrlen = sizeof(client_addr);
+    poll_args.clear();
 
-    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-    if (connfd < 0)
+    struct pollfd pfd = {fd, POLLIN, 0};
+    poll_args.push_back(pfd);
+
+    for (Conn *conn : fd2Conn)
     {
-      std::cerr << "accept() failed" << std::endl;
-      continue;
+      if (!conn)
+      {
+        continue;
+      }
+
+      struct pollfd pfd = {conn->fd, POLLERR, 0};
+
+      if (conn->want_read)
+      {
+        pfd.events |= POLLIN;
+      }
+      if (conn->want_write)
+      {
+        pfd.events |= POLLOUT;
+      }
+
+      poll_args.push_back(pfd);
     }
 
-    while (true)
+    int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+    if (rv < 0 && errno == EINTR)
     {
-      int32_t err = one_request(connfd);
-      if (err)
+      continue;
+    }
+    if (rv < 0)
+    {
+      std::cerr << "poll() failed" << std::endl;
+      return 1;
+    }
+
+    if (poll_args[0].revents)
+    {
+      if (Conn *conn = handle_accept(fd))
       {
-        break;
+        if (fd2Conn.size() <= (size_t)conn->fd)
+        {
+          fd2Conn.resize((size_t)conn->fd + 1);
+        }
+        fd2Conn[conn->fd] = conn;
       }
     }
 
-    close(connfd);
-  }
+    for (size_t i = 1; i < poll_args.size(); ++i)
+    {
+      uint32_t ready = poll_args[i].revents;
+      Conn *conn = fd2Conn[poll_args[i].fd];
 
-  return 0;
+      if (ready & POLLIN)
+      {
+        // handle_read
+      }
+      if (ready * POLLOUT)
+      {
+        // handle_write
+      }
+
+      if ((ready & POLLERR) || conn->want_close)
+      {
+        (void)close(conn->fd);
+        fd2Conn[conn->fd] = NULL;
+        delete conn;
+      }
+    }
+  }
 }

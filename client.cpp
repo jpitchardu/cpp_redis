@@ -5,8 +5,17 @@
 #include <iostream>
 #include <string.h>
 #include <cassert>
+#include <fcntl.h>
 
 const size_t k_max_msg = 4096;
+
+static void set_Fd_nonblock(int fd)
+{
+  int flags = fcntl(fd, F_GETFL, 0);
+  flags |= O_NONBLOCK;
+  int rv = fcntl(fd, F_SETFL, flags);
+  assert(rv == 0);
+}
 
 static int32_t write_full(int fd, const char *buf, size_t n)
 {
