@@ -133,7 +133,9 @@ static void handle_read(Conn *conn)
 
   conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
 
-  try_one_request(conn);
+  while (try_one_request(conn))
+  {
+  }
 
   if (conn->outgoing.size() > 0)
   {

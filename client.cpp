@@ -6,6 +6,7 @@
 #include <string.h>
 #include <cassert>
 #include <fcntl.h>
+#include <vector>
 
 const size_t k_max_msg = 4096;
 
@@ -57,9 +58,8 @@ static int32_t read_full(int fd, char *buf, size_t n)
   return 0;
 }
 
-static int32_t query(int fd, const char *text)
+static int32_t send_req(int fd, const char *text, size_t len)
 {
-  uint32_t len = (uint32_t)strlen(text);
 
   if (len > k_max_msg)
   {
@@ -71,11 +71,13 @@ static int32_t query(int fd, const char *text)
   memcpy(wbuf, &len, 4);
   memcpy(&wbuf[4], text, len);
 
-  if (int32_t err = write_full(fd, wbuf, 4 + len))
-  {
-    return err;
-  }
+  return write_full(fd, wbuf, 4 + len);
+}
 
+static int32_t read_res(int fd)
+{
+
+  uint32_t len = 0;
   char rbuf[4 + k_max_msg + 1];
   errno = 0;
   int32_t err = read_full(fd, rbuf, 4);
@@ -129,20 +131,30 @@ int main()
     return 1;
   }
 
-  int32_t err = query(fd, "hello1");
-  if (err)
+  // multiple pipelined requests
+  std::vector<std::string> query_list = {
+      "hello1",
+      "hello2",
+      "hello3",
+      // a large message requires multiple event loop iterations
+      std::string(k_max_msg, 'z'),
+      "hello5",
+  };
+  for (const std::string &s : query_list)
   {
-    goto L_DONE;
+    int32_t err = send_req(fd, s.data(), s.size());
+    if (err)
+    {
+      goto L_DONE;
+    }
   }
-  err = query(fd, "hello2");
-  if (err)
+  for (size_t i = 0; i < query_list.size(); ++i)
   {
-    goto L_DONE;
-  }
-  err = query(fd, "hello3");
-  if (err)
-  {
-    goto L_DONE;
+    int32_t err = read_res(fd);
+    if (err)
+    {
+      goto L_DONE;
+    }
   }
 
 L_DONE:
