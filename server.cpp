@@ -41,33 +41,15 @@ static Conn *handle_accept(int fd)
     return NULL;
   }
 
+  uint32_t ip = addr.sin_addr.s_addr;
+  printf("new client from %u.%u.%u.%u:%u\n", ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24, ntohs(addr.sin_port));
+
   set_Fd_nonblock(conn_fd);
 
   Conn *conn = new Conn();
   conn->fd = conn_fd;
   conn->want_read = true;
   return conn;
-}
-
-static void handle_read(Conn *conn)
-{
-  uint8_t buf[64 * 1024];
-  ssize_t rv = read(conn->fd, buf, sizeof(buf));
-  if (rv <= 0)
-  {
-    conn->want_close = true;
-    return;
-  }
-
-  conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
-
-  try_one_request(conn);
-
-  if (conn->outgoing.size() > 0)
-  {
-    conn->want_read = false;
-    conn->want_write = true;
-  }
 }
 
 static bool try_one_request(Conn *conn)
@@ -92,6 +74,9 @@ static bool try_one_request(Conn *conn)
   }
 
   const uint8_t *data = &conn->incoming[4];
+
+  // got one request, do some application logic
+  printf("client says: len:%d data:%.*s\n", len, len < 100 ? len : 100, data);
 
   conn->outgoing.insert(conn->outgoing.end(), (uint8_t *)&len, (uint8_t *)&len + 4);
   conn->outgoing.insert(conn->outgoing.end(), data, data + len);
@@ -121,6 +106,43 @@ static void handle_write(Conn *conn)
   }
 }
 
+static void handle_read(Conn *conn)
+{
+  uint8_t buf[64 * 1024];
+  ssize_t rv = read(conn->fd, buf, sizeof(buf));
+
+  if (rv < 0 && errno == EAGAIN)
+  {
+    return; // actually not ready
+  }
+
+  if (rv < 0)
+  {
+    std::cerr << "read() failed" << std::endl;
+    conn->want_close = true;
+    return;
+  }
+
+  if (rv == 0)
+  {
+
+    printf(conn->incoming.size() == 0 ? "client closed" : "unexpected EOF");
+    conn->want_close = true;
+    return; // want close
+  }
+
+  conn->incoming.insert(conn->incoming.end(), buf, buf + rv);
+
+  try_one_request(conn);
+
+  if (conn->outgoing.size() > 0)
+  {
+    conn->want_read = false;
+    conn->want_write = true;
+    return handle_write(conn);
+  }
+}
+
 int main()
 {
   int val = 1;
@@ -135,22 +157,18 @@ int main()
   addr.sin_addr.s_addr = ntohl(0);
 
   int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
-
   if (rv)
   {
     std::cerr << "bind() failed" << std::endl;
     return 1;
   }
 
-  int rv2 = listen(fd, SOMAXCONN);
-
-  if (rv2)
+  rv = listen(fd, SOMAXCONN);
+  if (rv)
   {
     std::cerr << "listen() failed" << std::endl;
     return 1;
   }
-
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
 
   // a map of all client connections, keyed by fd
   std::vector<Conn *> fd2Conn;
@@ -215,11 +233,11 @@ int main()
 
       if (ready & POLLIN)
       {
-        // handle_read
+        handle_read(conn);
       }
-      if (ready * POLLOUT)
+      if (ready & POLLOUT)
       {
-        // handle_write
+        handle_write(conn);
       }
 
       if ((ready & POLLERR) || conn->want_close)
